@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""
+PulseLog Lightweight CLI Server Log Agent (100% flag & protocol compatible with cmd/log-agent/main.go).
+Supports:
+  --file /path/to/app.log     Tail log file with rotation/truncation detection
+  --stdin                     Stream unstructured log lines from standard input
+  --simulate                  Continuous multi-service log generator
+  --inject-critical           Send immediate CRITICAL_ERROR events and exit
+  --burst N                   Send a high-volume burst of N logs to test backpressure
+  --gzip                      Compress batch payloads with gzip
+"""
+
+import argparse
+import gzip
+import json
+import os
+import random
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+
+def iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def build_sim_events(count: int, mode: str, agent_id: str, host: str, service: str) -> list:
+    now_str = iso_now()
+    events = []
+    for i in range(count):
+        trace_id = f"tr-{random.getrandbits(32):08x}"
+        if mode == "critical":
+            line = (
+                f"{now_str} [CRITICAL] [{service}] CRITICAL_ERROR: Upstream database cluster quorum lost "
+                f"trace_id={trace_id} latency=1940ms host={host}"
+            )
+        elif mode == "backpressure_spike" and (i % 5 < 3):
+            line = f"{now_str} [DEBUG] [{service}] trace_id={trace_id} Connection pool heartbeat ok latency=3ms host={host}"
+        else:
+            line = (
+                f'{{"ts":"{now_str}","level":"info","service":"{service}","host":"{host}",'
+                f'"trace_id":"{trace_id}","latency_ms":{random.randint(12, 85)},"msg":"Processed request batch #{i+1}"}}'
+            )
+        events.append({
+            "agent_id": agent_id,
+            "host": host,
+            "service_hint": service,
+            "source_path": f"/var/log/{service}.log",
+            "offset": i + 1,
+            "timestamp": now_str,
+            "raw_line": line,
+        })
+    return events
+
+
+def send_with_backoff(endpoint: str, batch: dict, use_gzip: bool) -> dict:
+    raw_bytes = json.dumps(batch).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if use_gzip:
+        raw_bytes = gzip.compress(raw_bytes)
+        headers["Content-Encoding"] = "gzip"
+
+    base_backoff = 0.08
+    for attempt in range(5):
+        req = urllib.request.Request(endpoint, data=raw_bytes, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp_body = json.loads(resp.read().decode("utf-8"))
+                bp_state = resp.headers.get("X-Backpressure-State", "NORMAL")
+                resp_body["http_status"] = resp.status
+                resp_body["header_backpressure"] = bp_state
+                return resp_body
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                sleep_s = base_backoff * (2 ** attempt) + random.uniform(0.01, 0.05)
+                print(f"[PulseLog Agent] HTTP 429 Circuit Open — exponential backoff {sleep_s*1000:.0f}ms...", file=sys.stderr)
+                time.sleep(sleep_s)
+                continue
+            raise
+        except Exception:
+            time.sleep(base_backoff * (2 ** attempt))
+    return {"status": "failed"}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="PulseLog Lightweight CLI Log Agent")
+    ap.add_argument("--endpoint", default="http://localhost:8080/api/v1/ingest", help="Central ingestion HTTP endpoint")
+    ap.add_argument("--agent-id", default="edge-agent-01", help="Unique agent ID")
+    ap.add_argument("--host", default="prod-node-01", help="Server hostname")
+    ap.add_argument("--service", default="payment-service", help="Default service name")
+    ap.add_argument("--file", default="", help="Log file path to tail")
+    ap.add_argument("--stdin", action="store_true", help="Read logs from stdin")
+    ap.add_argument("--simulate", action="store_true", help="Continuously stream simulated logs")
+    ap.add_argument("--inject-critical", action="store_true", help="Send CRITICAL_ERROR burst and exit")
+    ap.add_argument("--burst", type=int, default=0, help="Send one-shot burst of N logs and exit")
+    ap.add_argument("--rate", type=int, default=20, help="Logs/sec in simulate mode")
+    ap.add_argument("--batch-size", type=int, default=50, help="Max events per batch")
+    ap.add_argument("--linger-ms", type=int, default=200, help="Max linger time in ms")
+    ap.add_argument("--gzip", action="store_true", help="Compress batches using gzip")
+    args = ap.parse_args()
+
+    if args.inject_critical:
+        events = build_sim_events(4, "critical", args.agent_id, args.host, args.service)
+        batch = {
+            "batch_id": f"{args.agent_id}-{int(time.time()*1000)}",
+            "agent_id": args.agent_id,
+            "sent_at": iso_now(),
+            "compressed": args.gzip,
+            "events": events,
+        }
+        res = send_with_backoff(args.endpoint, batch, args.gzip)
+        print(f"[PulseLog Agent] Dispatched {len(events)} CRITICAL_ERROR events -> {json.dumps(res)}")
+        return
+
+    if args.burst > 0:
+        events = build_sim_events(args.burst, "backpressure_spike", args.agent_id, args.host, args.service)
+        batch = {
+            "batch_id": f"{args.agent_id}-{int(time.time()*1000)}",
+            "agent_id": args.agent_id,
+            "sent_at": iso_now(),
+            "compressed": args.gzip,
+            "events": events,
+        }
+        res = send_with_backoff(args.endpoint, batch, args.gzip)
+        print(f"[PulseLog Agent] Dispatched burst of {len(events)} events -> {json.dumps(res)}")
+        return
+
+    if args.stdin:
+        events = []
+        for idx, line in enumerate(sys.stdin):
+            clean = line.strip()
+            if not clean:
+                continue
+            events.append({
+                "agent_id": args.agent_id,
+                "host": args.host,
+                "service_hint": args.service,
+                "source_path": "stdin",
+                "offset": idx + 1,
+                "timestamp": iso_now(),
+                "raw_line": clean,
+            })
+            if len(events) >= args.batch_size:
+                res = send_with_backoff(args.endpoint, {"batch_id": f"stdin-{idx}", "agent_id": args.agent_id, "events": events}, args.gzip)
+                print(f"[PulseLog Agent] Flushed stdin batch ({len(events)} events) -> {json.dumps(res)}")
+                events = []
+        if events:
+            res = send_with_backoff(args.endpoint, {"batch_id": "stdin-final", "agent_id": args.agent_id, "events": events}, args.gzip)
+            print(f"[PulseLog Agent] Flushed stdin batch ({len(events)} events) -> {json.dumps(res)}")
+        return
+
+    if args.file:
+        print(f"[PulseLog Agent] Tailing {args.file} -> {args.endpoint}")
+        offset = 0
+        while True:
+            if os.path.exists(args.file):
+                sz = os.path.getsize(args.file)
+                if sz < offset:
+                    offset = 0
+                with open(args.file, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(offset)
+                    lines = f.readlines()
+                    offset = f.tell()
+                if lines:
+                    evs = [
+                        {
+                            "agent_id": args.agent_id,
+                            "host": args.host,
+                            "service_hint": args.service,
+                            "source_path": args.file,
+                            "offset": offset,
+                            "timestamp": iso_now(),
+                            "raw_line": ln.strip(),
+                        }
+                        for ln in lines
+                        if ln.strip()
+                    ]
+                    if evs:
+                        send_with_backoff(args.endpoint, {"batch_id": f"file-{offset}", "agent_id": args.agent_id, "events": evs}, args.gzip)
+            time.sleep(args.linger_ms / 1000.0)
+
+    if args.simulate:
+        print(f"[PulseLog Agent] Streaming simulated logs at {args.rate} events/sec -> {args.endpoint}")
+        while True:
+            evs = build_sim_events(max(1, args.rate // 4), "standard", args.agent_id, args.host, args.service)
+            send_with_backoff(args.endpoint, {"batch_id": f"sim-{int(time.time()*1000)}", "agent_id": args.agent_id, "events": evs}, args.gzip)
+            time.sleep(0.25)
+
+    ap.print_help()
+
+
+if __name__ == "__main__":
+    main()
+

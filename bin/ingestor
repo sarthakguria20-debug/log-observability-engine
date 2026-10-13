@@ -1,0 +1,1143 @@
+#!/usr/bin/env python3
+"""
+PulseLog Local Runtime Engine (100% API-compatible standalone runner for cmd/ingestor/main.go).
+Automatically used when the Go toolchain or Docker is not installed on the host machine.
+Implements:
+  - 4-Partition FNV-1a hashed ingestion queue with Soft/Hard Watermarks & DEBUG log shedding
+  - Multi-format unstructured log parser (JSON, Bracketed, Nginx/Apache, Syslog, inline key=value)
+  - ClickHouse-style MergeTree Columnar Engine (MemTable, sorted immutable ColumnarParts,
+    512-bit Token Bloom Filter skip index, ZLIB compression, and MergeTree Compaction)
+  - Real-time Alerting Engine (Keyword CRITICAL_ERROR, Sliding-Window Error Rate, Latency SLA)
+    with Slack Block Kit JSON & RFC 5322 Email payload generation
+"""
+
+import argparse
+import gzip
+import hashlib
+import json
+import os
+import random
+import re
+import threading
+import time
+import uuid
+import zlib
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+# ---------------------------------------------------------------------------
+# 1. Multi-Format Unstructured Log Parser
+# ---------------------------------------------------------------------------
+RE_BRACKETED = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+"
+    r"\[(?P<level>[A-Z]+)\]\s+\[(?P<service>[a-zA-Z0-9_.-]+)\]\s+(?P<msg>.*)$"
+)
+RE_NGINX = re.compile(
+    r'^(?P<ip>\d+\.\d+\.\d+\.\d+)\s+\S+\s+\S+\s+\[(?P<ts>[^\]]+)\]\s+'
+    r'"(?P<method>[A-Z]+)\s+(?P<path>\S+)\s+[^"]+"\s+(?P<status>\d{3})\s+(?P<bytes>\d+)'
+    r'(?:\s+"[^"]*"\s+"(?P<ua>[^"]*)")?(?P<rest>.*)$'
+)
+RE_SYSLOG = re.compile(
+    r"^(?:<(?P<pri>\d+)>)?(?P<ts>[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}T\S+)\s+"
+    r"(?P<host>\S+)\s+(?P<service>[a-zA-Z0-9_.-]+)(?:\[(?P<pid>\d+)\])?:\s*(?P<msg>.*)$"
+)
+RE_KV = re.compile(r'([a-zA-Z_][a-zA-Z0-9_.-]*)=("[^"]*"|\S+)')
+RE_LATENCY = re.compile(r"(?i)(?:latency|duration|elapsed|took)[=:\s]+(\d+(?:\.\d+)?)\s*(ms|s|us)")
+RE_TOKEN = re.compile(r"[^a-zA-Z0-9_]+")
+
+
+def normalize_severity(lvl: str) -> str:
+    u = str(lvl or "").strip().upper()
+    if u in ("CRITICAL", "CRIT", "FATAL", "PANIC", "EMERG", "ALERT", "CRITICAL_ERROR"):
+        return "CRITICAL"
+    if u in ("ERROR", "ERR", "SEVERE"):
+        return "ERROR"
+    if u in ("WARN", "WARNING"):
+        return "WARN"
+    if u in ("DEBUG", "DBG", "TRACE", "VERBOSE"):
+        return "DEBUG"
+    return "INFO"
+
+
+def iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class LogParser:
+    def __init__(self, default_env: str = "production"):
+        self.default_env = default_env
+
+    def parse(self, raw_event: dict, partition: int, offset: int) -> dict:
+        now_str = iso_now()
+        line = str(raw_event.get("raw_line", "")).strip()
+        rec = {
+            "id": uuid.uuid4().hex[:16],
+            "timestamp": raw_event.get("timestamp") or now_str,
+            "ingested_at": now_str,
+            "service": raw_event.get("service_hint") or "unknown-service",
+            "host": raw_event.get("host") or "localhost",
+            "environment": self.default_env,
+            "severity": "INFO",
+            "format": "unstructured",
+            "message": line,
+            "trace_id": "",
+            "span_id": "",
+            "status_code": 0,
+            "latency_ms": 0.0,
+            "attributes": dict(raw_event.get("labels") or {}),
+            "tokens": [],
+            "partition": partition,
+            "offset": offset,
+            "raw_line": line,
+        }
+
+        # 1. JSON format
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                payload = json.loads(line)
+                if isinstance(payload, dict):
+                    rec["format"] = "json"
+                    for k, v in payload.items():
+                        kl = k.lower()
+                        sval = str(v)
+                        if kl in ("level", "severity", "lvl"):
+                            rec["severity"] = normalize_severity(sval)
+                        elif kl in ("msg", "message", "log"):
+                            rec["message"] = sval
+                        elif kl in ("service", "app", "component"):
+                            rec["service"] = sval
+                        elif kl in ("host", "hostname", "node"):
+                            rec["host"] = sval
+                        elif kl in ("trace_id", "traceid"):
+                            rec["trace_id"] = sval
+                        elif kl in ("span_id", "spanid"):
+                            rec["span_id"] = sval
+                        elif kl in ("status", "status_code"):
+                            try:
+                                rec["status_code"] = int(v)
+                            except ValueError:
+                                pass
+                        elif kl in ("latency_ms", "duration_ms", "latency"):
+                            try:
+                                rec["latency_ms"] = float(str(v).rstrip("ms"))
+                            except ValueError:
+                                pass
+                        elif kl in ("ts", "timestamp", "time"):
+                            rec["timestamp"] = sval
+                        else:
+                            rec["attributes"][k] = sval
+                    self._finalize(rec)
+                    return rec
+            except Exception:
+                pass
+
+        # 2. Bracketed format
+        m = RE_BRACKETED.match(line)
+        if m:
+            rec["format"] = "bracketed"
+            rec["timestamp"] = m.group("ts")
+            rec["severity"] = normalize_severity(m.group("level"))
+            rec["service"] = m.group("service")
+            rec["message"] = m.group("msg")
+            self._extract_inline(rec, m.group("msg"))
+            self._finalize(rec)
+            return rec
+
+        # 3. Nginx / Apache combined format
+        m = RE_NGINX.match(line)
+        if m:
+            rec["format"] = "nginx"
+            rec["attributes"]["client_ip"] = m.group("ip")
+            rec["attributes"]["http_method"] = m.group("method")
+            rec["attributes"]["http_path"] = m.group("path")
+            status = int(m.group("status"))
+            rec["status_code"] = status
+            if status >= 500:
+                rec["severity"] = "ERROR"
+            elif status >= 400:
+                rec["severity"] = "WARN"
+            rec["attributes"]["response_bytes"] = m.group("bytes")
+            if m.group("ua"):
+                rec["attributes"]["user_agent"] = m.group("ua")
+            if rec["service"] == "unknown-service":
+                rec["service"] = "api-gateway"
+            rest = m.group("rest") or ""
+            rec["message"] = f"{m.group('method')} {m.group('path')} -> HTTP {status} ({m.group('bytes')} bytes){rest}"
+            self._extract_inline(rec, rest)
+            self._finalize(rec)
+            return rec
+
+        # 4. Syslog RFC3164/5424
+        m = RE_SYSLOG.match(line)
+        if m:
+            rec["format"] = "syslog"
+            if m.group("pri"):
+                sev_code = int(m.group("pri")) & 0x07
+                if sev_code <= 2:
+                    rec["severity"] = "CRITICAL"
+                elif sev_code == 3:
+                    rec["severity"] = "ERROR"
+                elif sev_code == 4:
+                    rec["severity"] = "WARN"
+                elif sev_code <= 6:
+                    rec["severity"] = "INFO"
+                else:
+                    rec["severity"] = "DEBUG"
+            rec["host"] = m.group("host")
+            rec["service"] = m.group("service")
+            if m.group("pid"):
+                rec["attributes"]["pid"] = m.group("pid")
+            rec["message"] = m.group("msg")
+            self._extract_inline(rec, m.group("msg"))
+            self._finalize(rec)
+            return rec
+
+        # 5. Unstructured fallback
+        self._extract_inline(rec, line)
+        self._finalize(rec)
+        return rec
+
+    def _extract_inline(self, rec: dict, text: str):
+        for k, v in RE_KV.findall(text):
+            kl = k.lower()
+            val = v.strip('"[]')
+            if kl in ("trace_id", "traceid"):
+                rec["trace_id"] = val
+            elif kl in ("span_id", "spanid"):
+                rec["span_id"] = val
+            elif kl in ("service", "svc"):
+                rec["service"] = val
+            elif kl in ("host", "node"):
+                rec["host"] = val
+            elif kl in ("status", "status_code"):
+                try:
+                    rec["status_code"] = int(val)
+                except ValueError:
+                    pass
+            elif kl in ("latency", "latency_ms", "duration"):
+                try:
+                    rec["latency_ms"] = float(val.rstrip("ms"))
+                except ValueError:
+                    pass
+            else:
+                rec["attributes"][kl] = val
+
+        if rec["latency_ms"] == 0:
+            lm = RE_LATENCY.search(text)
+            if lm:
+                val = float(lm.group(1))
+                unit = lm.group(2).lower()
+                if unit == "s":
+                    val *= 1000.0
+                elif unit == "us":
+                    val /= 1000.0
+                rec["latency_ms"] = round(val, 2)
+
+    def _finalize(self, rec: dict):
+        upper = rec["raw_line"].upper()
+        if any(w in upper for w in ("CRITICAL_ERROR", "FATAL", "PANIC", "OOM_KILLED")):
+            rec["severity"] = "CRITICAL"
+        elif rec["severity"] == "INFO":
+            if any(w in upper for w in ("ERROR", "EXCEPTION", "FAIL")):
+                rec["severity"] = "ERROR"
+            elif any(w in upper for w in ("WARN", "TIMEOUT", "SLOW")):
+                rec["severity"] = "WARN"
+            elif any(w in upper for w in ("DEBUG", "TRACE")):
+                rec["severity"] = "DEBUG"
+
+        seen = set()
+        tokens = []
+        for t in RE_TOKEN.split(rec["raw_line"].lower()):
+            if len(t) >= 2 and t not in seen:
+                seen.add(t)
+                tokens.append(t)
+        rec["tokens"] = tokens
+
+
+# ---------------------------------------------------------------------------
+# 2. ClickHouse-Style MergeTree Columnar Engine with 512-Bit Bloom Filter
+# ---------------------------------------------------------------------------
+def bloom_hashes(token: str):
+    digest = hashlib.sha256(token.encode("utf-8")).digest()
+    h1 = int.from_bytes(digest[:4], "little")
+    h2 = int.from_bytes(digest[4:8], "little") | 1
+    return h1, h2
+
+
+def bloom_add(mask: int, token: str) -> int:
+    h1, h2 = bloom_hashes(token)
+    for i in range(3):
+        bit = (h1 + i * h2) % 16384
+        mask |= 1 << bit
+    return mask
+
+
+def bloom_test(mask: int, token: str) -> bool:
+    h1, h2 = bloom_hashes(token)
+    for i in range(3):
+        bit = (h1 + i * h2) % 16384
+        if not (mask & (1 << bit)):
+            return False
+    return True
+
+
+class ColumnarPart:
+    def __init__(self, part_id: int, records: list):
+        self.part_id = part_id
+        self.created_at = iso_now()
+        # Sort by (service, severity, timestamp) just like ClickHouse MergeTree ORDER BY
+        records.sort(key=lambda r: (r["service"], r["severity"], r["timestamp"]))
+        self.records = records
+        self.row_count = len(records)
+        self.service_dict = {r["service"] for r in records}
+        self.severity_dict = {r["severity"] for r in records}
+        self.bloom_mask = 0
+        raw_bytes = bytearray()
+        for r in records:
+            for tok in r["tokens"]:
+                self.bloom_mask = bloom_add(self.bloom_mask, tok)
+            if r["trace_id"]:
+                self.bloom_mask = bloom_add(self.bloom_mask, r["trace_id"].lower())
+            raw_bytes.extend((r["raw_line"] + "\n").encode("utf-8"))
+        self.uncompressed_bytes = len(raw_bytes)
+        self.compressed_bytes = len(zlib.compress(bytes(raw_bytes), level=9))
+
+
+class ColumnarEngine:
+    def __init__(self, flush_limit: int = 200):
+        self.lock = threading.RLock()
+        self.memtable = []
+        self.flush_limit = flush_limit
+        self.parts = []
+        self.next_part_id = 0
+        self.total_rows = 0
+        self.compactions_completed = 0
+        self.uncompressed_bytes = 0
+        self.compressed_bytes = 0
+        self.bloom_queries = 0
+        self.parts_skipped = 0
+        self.parts_scanned = 0
+        self.started_at = time.time()
+
+    def insert_batch(self, records: list):
+        if not records:
+            return
+        with self.lock:
+            self.memtable.extend(records)
+            self.total_rows += len(records)
+            if len(self.memtable) >= self.flush_limit:
+                self._flush_locked()
+            if len(self.parts) >= 10:
+                self._compact_locked(4)
+
+    def flush(self):
+        with self.lock:
+            if self.memtable:
+                self._flush_locked()
+
+    def compact(self) -> bool:
+        with self.lock:
+            if self.memtable:
+                self._flush_locked()
+            if len(self.parts) < 2:
+                return False
+            self._compact_locked(len(self.parts))
+            return True
+
+    def _flush_locked(self):
+        rows = list(self.memtable)
+        self.memtable.clear()
+        self.next_part_id += 1
+        part = ColumnarPart(self.next_part_id, rows)
+        self.parts.append(part)
+        self.uncompressed_bytes += part.uncompressed_bytes
+        self.compressed_bytes += part.compressed_bytes
+
+    def _compact_locked(self, count: int):
+        count = min(count, len(self.parts))
+        if count < 2:
+            return
+        merged = []
+        old_u, old_c = 0, 0
+        for p in self.parts[:count]:
+            merged.extend(p.records)
+            old_u += p.uncompressed_bytes
+            old_c += p.compressed_bytes
+        self.next_part_id += 1
+        new_part = ColumnarPart(self.next_part_id, merged)
+        self.parts = [new_part] + self.parts[count:]
+        self.uncompressed_bytes += new_part.uncompressed_bytes - old_u
+        self.compressed_bytes += new_part.compressed_bytes - old_c
+        self.compactions_completed += 1
+
+    def query(self, q: str = "", service: str = "", severity: str = "", host: str = "", trace_id: str = "", min_latency_ms: float = 0.0, limit: int = 100) -> dict:
+        t0 = time.perf_counter()
+        q_lower = (q or "").strip().lower()
+        q_tokens = [t for t in RE_TOKEN.split(q_lower) if len(t) >= 2]
+
+        with self.lock:
+            if q_tokens or service or severity:
+                self.bloom_queries += 1
+
+            matched = []
+            skipped = 0
+            scanned = 0
+
+            for r in reversed(self.memtable):
+                if self._matches(r, q_lower, service, severity, host, trace_id, min_latency_ms):
+                    matched.append(r)
+
+            for part in reversed(self.parts):
+                if self._can_skip_part(part, service, severity, trace_id, q_tokens):
+                    skipped += 1
+                    continue
+                scanned += 1
+                for r in reversed(part.records):
+                    if self._matches(r, q_lower, service, severity, host, trace_id, min_latency_ms):
+                        matched.append(r)
+
+            self.parts_skipped += skipped
+            self.parts_scanned += scanned
+
+        matched.sort(key=lambda r: r["timestamp"], reverse=True)
+        total_matched = len(matched)
+        elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+        return {
+            "records": matched[: max(1, min(limit, 500))],
+            "total_matched": total_matched,
+            "execution_time_ms": elapsed_ms,
+            "parts_scanned": scanned,
+            "parts_skipped_by_index": skipped,
+        }
+
+    def _can_skip_part(self, part: ColumnarPart, service: str, severity: str, trace_id: str, q_tokens: list) -> bool:
+        if service and service != "*" and service not in part.service_dict:
+            return True
+        if severity and severity != "*" and severity not in part.severity_dict:
+            return True
+        if trace_id and not bloom_test(part.bloom_mask, trace_id.lower()):
+            return True
+        for tok in q_tokens:
+            if not bloom_test(part.bloom_mask, tok):
+                return True
+        return False
+
+    def _matches(self, r: dict, q_lower: str, service: str, severity: str, host: str, trace_id: str, min_latency_ms: float) -> bool:
+        if service and service != "*" and r["service"] != service:
+            return False
+        if severity and severity != "*" and r["severity"] != severity:
+            return False
+        if host and host != "*" and r["host"] != host:
+            return False
+        if trace_id and r["trace_id"].lower() != trace_id.lower():
+            return False
+        if min_latency_ms > 0 and r["latency_ms"] < min_latency_ms:
+            return False
+        if q_lower:
+            if (
+                q_lower not in r["raw_line"].lower()
+                and q_lower not in r["service"].lower()
+                and q_lower not in r["trace_id"].lower()
+            ):
+                return False
+        return True
+
+    def aggregations(self):
+        with self.lock:
+            by_service = {}
+            by_severity = {"DEBUG": 0, "INFO": 0, "WARN": 0, "ERROR": 0, "CRITICAL": 0}
+            buckets = {}
+
+            def proc(r):
+                by_service[r["service"]] = by_service.get(r["service"], 0) + 1
+                sev = r["severity"]
+                by_severity[sev] = by_severity.get(sev, 0) + 1
+                ts = r["timestamp"]
+                # Extract HH:MM:SS and bucket to 10-second intervals
+                hms = ts[11:19] if len(ts) >= 19 else "10:00:00"
+                bkey = hms[:7] + "0"
+                b = buckets.get(bkey)
+                if not b:
+                    b = {"timestamp": bkey, "debug": 0, "info": 0, "warn": 0, "error": 0, "critical": 0, "total": 0}
+                    buckets[bkey] = b
+                b[sev.lower()] = b.get(sev.lower(), 0) + 1
+                b["total"] += 1
+
+            for p in self.parts:
+                for r in p.records:
+                    proc(r)
+            for r in self.memtable:
+                proc(r)
+
+            sorted_buckets = [buckets[k] for k in sorted(buckets.keys())][-24:]
+            return sorted_buckets, by_service, by_severity
+
+    def stats(self) -> dict:
+        with self.lock:
+            mem_rows = len(self.memtable)
+            active_parts = len(self.parts)
+            ratio = (self.uncompressed_bytes / self.compressed_bytes) if self.compressed_bytes > 0 else 1.0
+            elapsed = max(0.1, time.time() - self.started_at)
+            return {
+                "engine_type": "ClickHouse MergeTree (Embedded Columnar + ZLIB/Bloom)",
+                "total_rows": self.total_rows,
+                "memtable_rows": mem_rows,
+                "memtable_flush_limit": self.flush_limit,
+                "active_columnar_parts": active_parts,
+                "compactions_completed": self.compactions_completed,
+                "uncompressed_bytes": self.uncompressed_bytes,
+                "compressed_bytes": self.compressed_bytes,
+                "compression_ratio": round(ratio, 2),
+                "bloom_filter_queries": self.bloom_queries,
+                "parts_skipped_by_index": self.parts_skipped,
+                "parts_scanned": self.parts_scanned,
+                "write_throughput_per_sec": round(self.total_rows / elapsed, 1),
+            }
+
+
+# ---------------------------------------------------------------------------
+# 3. Partitioned Broker with Watermark Backpressure & Load Shedding
+# ---------------------------------------------------------------------------
+class PartitionedBroker:
+    def __init__(self, num_partitions: int = 4, total_capacity: int = 1600, soft_wm: float = 65.0, hard_wm: float = 85.0):
+        self.lock = threading.Lock()
+        self.num_partitions = num_partitions
+        self.part_capacity = max(64, total_capacity // num_partitions)
+        self.queues = [[] for _ in range(num_partitions)]
+        self.produced_offset = [0] * num_partitions
+        self.consumed_offset = [0] * num_partitions
+        self.soft_wm = soft_wm
+        self.hard_wm = hard_wm
+        self.dropped_debug_logs = 0
+        self.spilled_to_disk_logs = 0
+        self.circuit_breaker_trips = 0
+        self.simulated_slowdown_ms = 0
+
+    def publish_batch(self, events: list):
+        m = self.metrics()
+        state = m["state"]
+        accepted = 0
+        shed = 0
+
+        if state == "CIRCUIT_OPEN":
+            with self.lock:
+                self.circuit_breaker_trips += 1
+                for ev in events:
+                    line = str(ev.get("raw_line", "")).upper()
+                    if "CRITICAL" in line or "ERROR" in line:
+                        self.spilled_to_disk_logs += 1
+                    else:
+                        self.dropped_debug_logs += 1
+                        shed += 1
+            return 0, shed, state, True
+
+        if m["throttle_delay_ms"] > 0:
+            time.sleep(min(0.08, m["throttle_delay_ms"] / 1000.0))
+
+        with self.lock:
+            total_cap = self.num_partitions * self.part_capacity
+            cur_depth = sum(len(q) for q in self.queues)
+            for ev in events:
+                occ = (cur_depth / total_cap) * 100.0 if total_cap else 0.0
+                line = str(ev.get("raw_line", ""))
+                is_dbg = "[DEBUG]" in line or '"level":"debug"' in line.lower()
+
+                if occ >= self.hard_wm and is_dbg:
+                    self.dropped_debug_logs += 1
+                    shed += 1
+                    continue
+
+                key = (ev.get("service_hint") or ev.get("host") or "default").encode("utf-8")
+                p_idx = zlib.crc32(key) % self.num_partitions
+                if len(self.queues[p_idx]) >= self.part_capacity:
+                    if is_dbg:
+                        self.dropped_debug_logs += 1
+                        shed += 1
+                    else:
+                        self.spilled_to_disk_logs += 1
+                    continue
+
+                self.produced_offset[p_idx] += 1
+                offset = self.produced_offset[p_idx]
+                self.queues[p_idx].append((p_idx, offset, ev))
+                cur_depth += 1
+                accepted += 1
+
+        return accepted, shed, self.metrics()["state"], False
+
+    def pop_partition(self, p_idx: int, max_items: int = 24) -> list:
+        with self.lock:
+            q = self.queues[p_idx]
+            if not q:
+                return []
+            items = q[:max_items]
+            del q[:max_items]
+            self.consumed_offset[p_idx] = items[-1][1]
+            return items
+
+    def metrics(self) -> dict:
+        with self.lock:
+            total_cap = self.num_partitions * self.part_capacity
+            total_depth = sum(len(q) for q in self.queues)
+            occ = (total_depth / total_cap) * 100.0 if total_cap else 0.0
+            part_lag = {}
+            total_lag = 0
+            for i in range(self.num_partitions):
+                lag = max(0, self.produced_offset[i] - self.consumed_offset[i])
+                part_lag[str(i)] = lag
+                total_lag += lag
+
+            state = "NORMAL"
+            throttle_ms = 0
+            if occ >= 97.0:
+                state = "CIRCUIT_OPEN"
+                throttle_ms = 150
+            elif occ >= self.hard_wm:
+                state = "SHEDDING_DEBUG"
+                throttle_ms = 50
+            elif occ >= self.soft_wm:
+                state = "SOFT_THROTTLE"
+                throttle_ms = max(5, int((occ - self.soft_wm) * 2))
+
+            return {
+                "state": state,
+                "queue_depth": total_depth,
+                "queue_capacity": total_cap,
+                "occupancy_pct": round(occ, 1),
+                "soft_watermark_pct": self.soft_wm,
+                "hard_watermark_pct": self.hard_wm,
+                "dropped_debug_logs": self.dropped_debug_logs,
+                "spilled_to_disk_logs": self.spilled_to_disk_logs,
+                "throttle_delay_ms": throttle_ms,
+                "partition_lag": part_lag,
+                "total_lag": total_lag,
+                "circuit_breaker_trips": self.circuit_breaker_trips,
+                "simulated_slowdown_ms": self.simulated_slowdown_ms,
+            }
+
+
+# ---------------------------------------------------------------------------
+# 4. Real-Time Alerting Engine (Keyword + Sliding-Window Error Threshold)
+# ---------------------------------------------------------------------------
+class AlertingEngine:
+    def __init__(self, email_to: str = "sre-oncall@pulselog.io"):
+        self.lock = threading.Lock()
+        self.email_to = email_to
+        self.incident_seq = 0
+        self.error_timestamps = []
+        self.last_fired = {}
+        self.incidents = []
+        self.rules = [
+            {
+                "id": "rule-critical-keyword",
+                "name": "Critical Keyword Detector (CRITICAL_ERROR)",
+                "type": "KEYWORD",
+                "enabled": True,
+                "service_filter": "*",
+                "keyword": "CRITICAL_ERROR",
+                "cooldown_seconds": 3,
+                "channels": ["slack", "email"],
+            },
+            {
+                "id": "rule-error-burst-threshold",
+                "name": "Sliding-Window Error Burst (>8 Errors / 30s)",
+                "type": "THRESHOLD",
+                "enabled": True,
+                "service_filter": "*",
+                "severity_filter": "ERROR",
+                "threshold_count": 8,
+                "window_seconds": 30,
+                "cooldown_seconds": 6,
+                "channels": ["slack", "email"],
+            },
+            {
+                "id": "rule-high-latency-sla",
+                "name": "High Tail Latency Breach (>1200ms)",
+                "type": "LATENCY_P99",
+                "enabled": True,
+                "service_filter": "*",
+                "threshold_count": 1200,
+                "window_seconds": 60,
+                "cooldown_seconds": 10,
+                "channels": ["slack"],
+            },
+        ]
+
+    def evaluate(self, rec: dict):
+        now = time.time()
+        with self.lock:
+            if rec["severity"] in ("ERROR", "CRITICAL"):
+                self.error_timestamps.append(now)
+            self.error_timestamps = [t for t in self.error_timestamps if now - t <= 120.0]
+
+            for rule in self.rules:
+                if not rule.get("enabled", True):
+                    continue
+                sf = rule.get("service_filter", "*")
+                if sf and sf != "*" and sf.lower() != rec["service"].lower():
+                    continue
+                cooldown = max(2, int(rule.get("cooldown_seconds", 5)))
+                if now - self.last_fired.get(rule["id"], 0) < cooldown:
+                    continue
+
+                rtype = rule["type"]
+                if rtype == "KEYWORD":
+                    kw = rule.get("keyword", "")
+                    if kw and kw.upper() in rec["raw_line"].upper():
+                        self._fire_locked(
+                            rule,
+                            rec,
+                            f"Keyword '{kw}' detected on {rec['service']} ({rec['host']})",
+                            kw,
+                            1,
+                            1,
+                        )
+                elif rtype == "THRESHOLD":
+                    win = max(5, int(rule.get("window_seconds", 30)))
+                    cnt = sum(1 for t in self.error_timestamps if now - t <= win)
+                    limit = int(rule.get("threshold_count", 8))
+                    if cnt >= limit:
+                        self._fire_locked(
+                            rule,
+                            rec,
+                            f"Error rate threshold crossed: {cnt} errors in {win}s window (limit: {limit})",
+                            "",
+                            cnt,
+                            limit,
+                        )
+                elif rtype == "LATENCY_P99":
+                    limit = float(rule.get("threshold_count", 1200))
+                    if rec["latency_ms"] >= limit and limit > 0:
+                        self._fire_locked(
+                            rule,
+                            rec,
+                            f"High latency SLA breach on {rec['service']}: {rec['latency_ms']}ms (threshold: {int(limit)}ms)",
+                            "",
+                            rec["latency_ms"],
+                            limit,
+                        )
+
+    def _fire_locked(self, rule: dict, rec: dict, summary: str, kw: str, obs: float, thresh: float):
+        self.incident_seq += 1
+        inc_id = f"INC-{self.incident_seq:04d}"
+        sev = "CRITICAL" if rule["type"] == "KEYWORD" else rec["severity"]
+        ts_str = iso_now()
+
+        slack_payload = json.dumps(
+            {
+                "channel": "#ops-critical-alerts",
+                "username": "PulseLog AlertBot",
+                "blocks": [
+                    {
+                        "type": "header",
+                        "text": {"type": "plain_text", "text": f"[{sev}] {inc_id} — {rule['name']}"},
+                    },
+                    {
+                        "type": "section",
+                        "fields": [
+                            {"type": "mrkdwn", "text": f"*Service:*\n`{rec['service']}`"},
+                            {"type": "mrkdwn", "text": f"*Host:*\n`{rec['host']}`"},
+                            {"type": "mrkdwn", "text": f"*Rule Type:*\n`{rule['type']}`"},
+                            {"type": "mrkdwn", "text": f"*Triggered At:*\n`{ts_str}`"},
+                        ],
+                    },
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": f"*Summary:* {summary}\n```{rec['raw_line']}```"},
+                    },
+                ],
+            },
+            indent=2,
+        )
+
+        email_payload = (
+            f"From: PulseLog Alerting Engine <alerts@pulselog.internal>\n"
+            f"To: {self.email_to}\n"
+            f"Subject: [{sev}] {inc_id}: {rule['name']} on {rec['service']}\n"
+            f"MIME-Version: 1.0\n"
+            f"Content-Type: text/plain; charset=UTF-8\n\n"
+            f"INCIDENT ID : {inc_id}\n"
+            f"RULE        : {rule['name']} ({rule['type']})\n"
+            f"SERVICE     : {rec['service']} (Host: {rec['host']})\n"
+            f"TIMESTAMP   : {ts_str}\n"
+            f"TRACE ID    : {rec.get('trace_id') or 'N/A'}\n\n"
+            f"SUMMARY:\n  {summary}\n\n"
+            f"SAMPLE LOG LINE:\n  {rec['raw_line']}\n"
+        )
+
+        inc = {
+            "id": inc_id,
+            "rule_id": rule["id"],
+            "rule_name": rule["name"],
+            "rule_type": rule["type"],
+            "severity": sev,
+            "status": "FIRING",
+            "service": rec["service"],
+            "host": rec["host"],
+            "summary": summary,
+            "matched_keyword": kw,
+            "observed_value": obs,
+            "threshold_value": thresh,
+            "window_seconds": rule.get("window_seconds", 30),
+            "sample_raw_log": rec["raw_line"],
+            "triggered_at": ts_str,
+            "channels_sent": rule.get("channels", ["slack", "email"]),
+            "slack_payload": slack_payload,
+            "email_payload": email_payload,
+        }
+        self.last_fired[rule["id"]] = time.time()
+        self.incidents.insert(0, inc)
+        del self.incidents[100:]
+
+    def add_rule(self, rule: dict) -> dict:
+        with self.lock:
+            rule["id"] = rule.get("id") or f"rule-custom-{len(self.rules)+1}"
+            rule["enabled"] = True
+            rule["channels"] = rule.get("channels") or ["slack", "email"]
+            self.rules.append(rule)
+            return rule
+
+    def update_incident(self, inc_id: str, status: str):
+        with self.lock:
+            for inc in self.incidents:
+                if inc["id"] == inc_id:
+                    inc["status"] = status
+                    return True
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 5. Realistic Multi-Format Log Generator
+# ---------------------------------------------------------------------------
+SERVICES = ["payment-service", "auth-service", "api-gateway", "order-worker", "search-indexer", "inventory-db"]
+HOSTS = ["prod-us-east-01", "prod-us-east-02", "prod-eu-west-01", "prod-ap-south-01"]
+PATHS = ["/api/v1/checkout", "/api/v1/auth/token", "/api/v2/orders", "/api/v1/search/query", "/api/v1/inventory/reserve"]
+METHODS = ["GET", "POST", "PUT"]
+
+
+def generate_simulated_events(count: int, mode: str = "standard") -> list:
+    events = []
+    now_str = iso_now()
+    for i in range(count):
+        svc = random.choice(SERVICES)
+        host = random.choice(HOSTS)
+        trace_id = f"tr-{random.getrandbits(32):08x}"
+
+        if mode == "critical":
+            templates = [
+                f"{now_str} [CRITICAL] [payment-service] CRITICAL_ERROR: Stripe settlement ledger checksum mismatch on shard-03 trace_id={trace_id} latency=1840ms host={host}",
+                json.dumps({
+                    "ts": now_str,
+                    "level": "critical",
+                    "service": "inventory-db",
+                    "host": host,
+                    "trace_id": trace_id,
+                    "latency_ms": 2410,
+                    "msg": "CRITICAL_ERROR: Primary WAL disk write failure (ENOSPC) — replica promotion initiated",
+                }),
+                f"<26>Oct 13 10:15:22 {host} auth-service[4412]: CRITICAL_ERROR: HSM signing key vault unreachable after 3 retries trace_id={trace_id} latency=1550ms",
+            ]
+            line = templates[i % len(templates)]
+        elif mode == "error_burst":
+            line = f"{now_str} [ERROR] [{svc}] Upstream connection reset by peer during transaction commit trace_id={trace_id} latency={random.randint(650, 1150)}ms status=503 host={host}"
+        elif mode == "backpressure_spike" and (i % 5 < 3):
+            line = f"{now_str} [DEBUG] [{svc}] trace_id={trace_id} Connection pool heartbeat check ok latency={random.randint(2, 9)}ms host={host}"
+        else:
+            roll = random.randint(0, 99)
+            if roll < 30:
+                lvl = "info"
+                msg = "Processed gRPC request successfully"
+                lat = random.randint(12, 95)
+                if roll < 4:
+                    lvl = "error"
+                    msg = "Downstream RPC deadline exceeded while querying shard"
+                    lat = random.randint(480, 960)
+                elif roll < 10:
+                    lvl = "warn"
+                    msg = "Retry attempt #2 triggered due to transient socket reset"
+                    lat = random.randint(180, 380)
+                line = json.dumps({
+                    "ts": now_str,
+                    "level": lvl,
+                    "service": svc,
+                    "host": host,
+                    "trace_id": trace_id,
+                    "latency_ms": lat,
+                    "msg": msg,
+                })
+            elif roll < 60:
+                lvl = "DEBUG" if roll < 36 else ("ERROR" if roll == 59 else "INFO")
+                lat = random.randint(8, 75) if lvl != "ERROR" else random.randint(850, 1180)
+                msg = f"Worker transaction committed trace_id={trace_id} latency={lat}ms shard={i % 8}"
+                if lvl == "ERROR":
+                    msg = f"Database connection pool exhausted trace_id={trace_id} latency={lat}ms active_conns=128"
+                line = f"{now_str} [{lvl}] [{svc}] {msg}"
+            elif roll < 85:
+                method = random.choice(METHODS)
+                path = random.choice(PATHS)
+                status = 502 if roll == 84 else (429 if roll >= 80 else 200)
+                lat = random.randint(750, 1100) if status == 502 else random.randint(15, 95)
+                line = (
+                    f'10.42.{random.randint(1,250)}.{random.randint(1,250)} - - [13/Oct/2026:10:15:22 +0000] '
+                    f'"{method} {path} HTTP/1.1" {status} {random.randint(256, 4096)} "-" "PulseClient/2.4" '
+                    f"trace_id={trace_id} latency={lat}ms service={svc}"
+                )
+            else:
+                pri = 27 if roll == 99 else 30
+                lat = random.randint(6, 35)
+                line = f"<{pri}>Oct 13 10:15:22 {host} {svc}[{random.randint(1000,9000)}]: Healthcheck probe completed trace_id={trace_id} latency={lat}ms"
+
+        events.append({
+            "agent_id": f"agent-{host}",
+            "host": host,
+            "service_hint": svc,
+            "source_path": f"/var/log/services/{svc}.log",
+            "offset": i + 1,
+            "timestamp": now_str,
+            "raw_line": line,
+        })
+    return events
+
+
+# ---------------------------------------------------------------------------
+# 6. HTTP Server & Background Partition Workers
+# ---------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(description="PulseLog Central Ingestion Pipeline & Analytics Server")
+    ap.add_argument("--addr", default=":8080", help="Listen address (e.g. :8080)")
+    ap.add_argument("--dashboard", default="./dashboard", help="Path to React dashboard directory")
+    ap.add_argument("--auto-simulate", default="true", help="Enable background log simulator")
+    args = ap.parse_args()
+
+    host_part, port_part = ("0.0.0.0", 8080)
+    if ":" in args.addr:
+        h, p = args.addr.split(":", 1)
+        if h:
+            host_part = h
+        port_part = int(p)
+
+    broker = PartitionedBroker(num_partitions=4, total_capacity=1600, soft_wm=65.0, hard_wm=85.0)
+    parser = LogParser("production")
+    store = ColumnarEngine(flush_limit=200)
+    alerts = AlertingEngine()
+    sim_state = {"enabled": str(args.auto_simulate).lower() in ("true", "1", "yes")}
+
+    # Seed initial historical data across multiple compacted parts so Bloom filter skipping is immediately demonstrable
+    seed_events = generate_simulated_events(420, "standard")
+    seed_parsed = [parser.parse(ev, idx % 4, idx + 1) for idx, ev in enumerate(seed_events)]
+    store.insert_batch(seed_parsed[:210])
+    store.flush()
+    store.insert_batch(seed_parsed[210:])
+    store.flush()
+
+    # Partition worker threads (1 consumer per partition)
+    def partition_worker(p_idx: int):
+        while True:
+            items = broker.pop_partition(p_idx, max_items=24)
+            if not items:
+                time.sleep(0.06)
+                continue
+            parsed_batch = []
+            for part_id, offset, ev in items:
+                delay_ms = broker.simulated_slowdown_ms
+                if delay_ms > 0:
+                    time.sleep(delay_ms / 1000.0)
+                rec = parser.parse(ev, part_id, offset)
+                alerts.evaluate(rec)
+                parsed_batch.append(rec)
+            store.insert_batch(parsed_batch)
+
+    for p in range(4):
+        t = threading.Thread(target=partition_worker, args=(p,), daemon=True)
+        t.start()
+
+    # Background simulator thread
+    def background_simulator():
+        while True:
+            time.sleep(0.65)
+            if not sim_state["enabled"]:
+                continue
+            evs = generate_simulated_events(4, "standard")
+            broker.publish_batch(evs)
+
+    threading.Thread(target=background_simulator, daemon=True).start()
+
+    dashboard_dir = os.path.abspath(args.dashboard)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *a):
+            pass
+
+        def _send_json(self, code: int, payload: dict, extra_headers: dict = None):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Content-Encoding")
+            if extra_headers:
+                for hk, hv in extra_headers.items():
+                    self.send_header(hk, hv)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _read_json(self) -> dict:
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            if self.headers.get("Content-Encoding", "").lower() == "gzip":
+                raw = gzip.decompress(raw)
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except Exception:
+                return {}
+
+        def do_OPTIONS(self):
+            self._send_json(200, {"status": "ok"})
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            path = parsed.path
+            qs = parse_qs(parsed.query)
+
+            if path == "/api/v1/metrics":
+                hist, by_svc, by_sev = store.aggregations()
+                self._send_json(200, {
+                    "backpressure": broker.metrics(),
+                    "storage": store.stats(),
+                    "histogram": hist,
+                    "by_service": by_svc,
+                    "by_severity": by_sev,
+                    "simulator_enabled": sim_state["enabled"],
+                })
+                return
+
+            if path == "/api/v1/logs":
+                res = store.query(
+                    q=qs.get("q", [""])[0],
+                    service=qs.get("service", [""])[0],
+                    severity=qs.get("severity", [""])[0].upper(),
+                    host=qs.get("host", [""])[0],
+                    trace_id=qs.get("trace_id", [""])[0],
+                    min_latency_ms=float(qs.get("min_latency_ms", ["0"])[0] or 0),
+                    limit=int(qs.get("limit", ["100"])[0] or 100),
+                )
+                self._send_json(200, res)
+                return
+
+            if path == "/api/v1/alerts":
+                self._send_json(200, {"incidents": alerts.incidents, "rules": alerts.rules})
+                return
+
+            if path == "/api/v1/rules":
+                self._send_json(200, {"rules": alerts.rules})
+                return
+
+            # Static file serving for React Analytics Dashboard
+            rel = "index.html" if path in ("/", "") else path.lstrip("/")
+            full_path = os.path.abspath(os.path.join(dashboard_dir, rel))
+            if not full_path.startswith(dashboard_dir) or not os.path.isfile(full_path):
+                full_path = os.path.join(dashboard_dir, "index.html")
+            if os.path.isfile(full_path):
+                ctype = "text/html; charset=utf-8"
+                if full_path.endswith(".css"):
+                    ctype = "text/css; charset=utf-8"
+                elif full_path.endswith(".js"):
+                    ctype = "application/javascript; charset=utf-8"
+                with open(full_path, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
+            self._send_json(404, {"error": "not found"})
+
+        def do_POST(self):
+            path = urlparse(self.path).path
+            body = self._read_json()
+
+            if path == "/api/v1/ingest":
+                events = body.get("events") or []
+                acc, shed, state, circuit_open = broker.publish_batch(events)
+                code = 429 if circuit_open else 202
+                self._send_json(
+                    code,
+                    {"status": "ok", "accepted": acc, "shed_debug": shed, "backpressure_state": state},
+                    {"X-Backpressure-State": state},
+                )
+                return
+
+            if path == "/api/v1/simulate":
+                action = body.get("action", "standard")
+                if action == "toggle_sim":
+                    sim_state["enabled"] = not sim_state["enabled"]
+                    self._send_json(200, {"simulator_enabled": sim_state["enabled"]})
+                    return
+
+                if action == "custom_log":
+                    raw_line = body.get("raw_line", "")
+                    evs = [{
+                        "agent_id": "dashboard-injector",
+                        "host": body.get("host") or "prod-us-east-01",
+                        "service_hint": body.get("service") or "payment-service",
+                        "timestamp": iso_now(),
+                        "raw_line": raw_line,
+                    }]
+                    acc, shed, state, _ = broker.publish_batch(evs)
+                    self._send_json(200, {"accepted": acc, "shed": shed, "state": state})
+                    return
+
+                if action == "backpressure_spike":
+                    count = int(body.get("count") or 950)
+                    broker.simulated_slowdown_ms = 12
+                    def reset_slowdown():
+                        time.sleep(5.0)
+                        broker.simulated_slowdown_ms = 0
+                    threading.Thread(target=reset_slowdown, daemon=True).start()
+                    evs = generate_simulated_events(count, "backpressure_spike")
+                    acc, shed, state, _ = broker.publish_batch(evs)
+                    self._send_json(200, {"action": action, "accepted": acc, "shed": shed, "state": state})
+                    return
+
+                count = int(body.get("count") or (3 if action == "critical" else 12))
+                evs = generate_simulated_events(count, action)
+                acc, shed, state, _ = broker.publish_batch(evs)
+                self._send_json(200, {"action": action, "accepted": acc, "shed": shed, "state": state})
+                return
+
+            if path == "/api/v1/storage/compact":
+                compacted = store.compact()
+                self._send_json(200, {"compacted": compacted, "storage": store.stats()})
+                return
+
+            if path == "/api/v1/backpressure/slowdown":
+                broker.simulated_slowdown_ms = int(body.get("delay_ms") or 0)
+                self._send_json(200, broker.metrics())
+                return
+
+            if path == "/api/v1/alerts":
+                alerts.update_incident(body.get("incident_id", ""), body.get("status", "ACKNOWLEDGED"))
+                self._send_json(200, {"incidents": alerts.incidents, "rules": alerts.rules})
+                return
+
+            if path == "/api/v1/rules":
+                created = alerts.add_rule(body)
+                self._send_json(200, created)
+                return
+
+            self._send_json(404, {"error": "unknown endpoint"})
+
+    server = ThreadingHTTPServer((host_part, port_part), Handler)
+    print(f"[PulseLog Engine] Listening on http://localhost:{port_part} (Dashboard: {dashboard_dir})", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

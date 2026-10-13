@@ -1,0 +1,17 @@
+# OS & Editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Node / Frontend build artifacts
+dashboard/node_modules/
+dashboard/dist/
+
+# Compiled Go binaries (keep standalone bin/ingestor and bin/log-agent scripts)
+bin/ingestor-go
+bin/log-agent-go
+*.log
