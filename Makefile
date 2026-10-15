@@ -1,9 +1,17 @@
-.PHONY: run agent-sim inject-critical spike test build-go docker-up
+.PHONY: run agent-sim inject-critical spike test build-go docker-up pages
 
 # Start the central ingestion pipeline & React Analytics Dashboard on http://localhost:8080
 run:
 	@chmod +x ./bin/ingestor ./bin/log-agent
 	./bin/ingestor --addr=:8080 --dashboard=./dashboard --auto-simulate=true
+
+# Sync dashboard assets into docs/ for GitHub Pages
+pages:
+	mkdir -p docs
+	cp dashboard/index.html docs/index.html
+	cp dashboard/styles.css docs/styles.css
+	cp dashboard/app.js docs/app.js
+	@echo "GitHub Pages docs/ directory synced successfully."
 
 # Run the CLI log agent in continuous multi-service streaming mode
 agent-sim:

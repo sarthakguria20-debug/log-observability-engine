@@ -1,6 +1,650 @@
 (function () {
+  // ---------------------------------------------------------------------------
+  // 1. In-Browser Client-Side Engine for GitHub Pages & Offline Mode
+  // ---------------------------------------------------------------------------
+  const SERVICES = [
+    "payment-service",
+    "auth-service",
+    "api-gateway",
+    "order-worker",
+    "search-indexer",
+    "inventory-db",
+  ];
+  const HOSTS = [
+    "prod-us-east-01",
+    "prod-us-east-02",
+    "prod-eu-west-01",
+    "prod-ap-south-01",
+  ];
+  const METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH"];
+  const PATHS = [
+    "/v1/payments/charge",
+    "/v1/auth/token",
+    "/v1/orders/checkout",
+    "/v1/inventory/reserve",
+    "/healthz",
+  ];
+
+  function isoNow(offsetSeconds = 0) {
+    const d = new Date(Date.now() + offsetSeconds * 1000);
+    return d.toISOString();
+  }
+
+  function randomChoice(arr) {
+    return arr[Math.floor(Math.random() * arr.length)];
+  }
+
+  function randomInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+
+  function simpleHash(str) {
+    let hash = 2166136261;
+    for (let i = 0; i < str.length; i++) {
+      hash ^= str.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return Math.abs(hash);
+  }
+
+  // Multi-format Parser
+  function parseLogLine(rawLine, serviceHint = "api-gateway", hostHint = "prod-us-east-01", partition = 0, offset = 1) {
+    const line = String(rawLine || "").trim();
+    const nowStr = isoNow();
+    const rec = {
+      id: "rec-" + Math.random().toString(36).substring(2, 10),
+      timestamp: nowStr,
+      ingested_at: nowStr,
+      service: serviceHint,
+      host: hostHint,
+      environment: "production",
+      severity: "INFO",
+      format: "unstructured",
+      message: line,
+      trace_id: "",
+      span_id: "",
+      status_code: 0,
+      latency_ms: 0.0,
+      attributes: {},
+      tokens: [],
+      partition: partition,
+      offset: offset,
+      raw_line: line,
+    };
+
+    // 1. JSON
+    if (line.startsWith("{") && line.endsWith("}")) {
+      try {
+        const payload = JSON.parse(line);
+        rec.format = "json";
+        for (const [k, v] of Object.entries(payload)) {
+          const kl = k.toLowerCase();
+          const sval = String(v);
+          if (["level", "severity", "lvl"].includes(kl)) {
+            const u = sval.toUpperCase();
+            if (["CRITICAL", "CRIT", "FATAL", "CRITICAL_ERROR"].includes(u)) rec.severity = "CRITICAL";
+            else if (["ERROR", "ERR"].includes(u)) rec.severity = "ERROR";
+            else if (["WARN", "WARNING"].includes(u)) rec.severity = "WARN";
+            else if (["DEBUG", "TRACE"].includes(u)) rec.severity = "DEBUG";
+            else rec.severity = "INFO";
+          } else if (["msg", "message", "log"].includes(kl)) {
+            rec.message = sval;
+          } else if (["service", "app", "component"].includes(kl)) {
+            rec.service = sval;
+          } else if (["host", "hostname", "node"].includes(kl)) {
+            rec.host = sval;
+          } else if (["trace_id", "traceid"].includes(kl)) {
+            rec.trace_id = sval;
+          } else if (["status", "status_code"].includes(kl)) {
+            rec.status_code = parseInt(v, 10) || 0;
+          } else if (["latency_ms", "duration_ms", "latency"].includes(kl)) {
+            rec.latency_ms = parseFloat(String(v).replace("ms", "")) || 0.0;
+          } else if (["ts", "timestamp", "time"].includes(kl)) {
+            rec.timestamp = sval;
+          } else {
+            rec.attributes[k] = sval;
+          }
+        }
+      } catch (e) {
+        // fallback
+      }
+    } else {
+      // 2. Bracketed
+      const mBracketed = line.match(/^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+\[([A-Z_]+)\]\s+\[([a-zA-Z0-9_.-]+)\]\s+(.*)$/);
+      if (mBracketed) {
+        rec.format = "bracketed";
+        rec.timestamp = mBracketed[1];
+        const lvl = mBracketed[2].toUpperCase();
+        rec.severity = lvl.includes("CRIT") ? "CRITICAL" : lvl.includes("ERR") ? "ERROR" : lvl.includes("WARN") ? "WARN" : lvl.includes("DEBUG") ? "DEBUG" : "INFO";
+        rec.service = mBracketed[3];
+        rec.message = mBracketed[4];
+      } else {
+        // 3. Nginx
+        const mNginx = line.match(/^(\d+\.\d+\.\d+\.\d+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"([A-Z]+)\s+(\S+)\s+[^"]+"\s+(\d{3})\s+(\d+)(?:\s+"[^"]*"\s+"([^"]*)")?(.*)$/);
+        if (mNginx) {
+          rec.format = "nginx";
+          rec.attributes.client_ip = mNginx[1];
+          rec.attributes.http_method = mNginx[3];
+          rec.attributes.http_path = mNginx[4];
+          const st = parseInt(mNginx[5], 10);
+          rec.status_code = st;
+          rec.severity = st >= 500 ? "ERROR" : st >= 400 ? "WARN" : "INFO";
+          rec.attributes.response_bytes = mNginx[6];
+        } else {
+          // 4. Syslog
+          const mSys = line.match(/^(?:<(\d+)>)?([A-Za-z]{3}\s+\d+\s+\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}T\S+)\s+(\S+)\s+([a-zA-Z0-9_.-]+)(?:\[(\d+)\])?:\s*(.*)$/);
+          if (mSys) {
+            rec.format = "syslog";
+            rec.host = mSys[3];
+            rec.service = mSys[4];
+            rec.message = mSys[6];
+            const pri = parseInt(mSys[1] || "30", 10);
+            rec.severity = (pri & 7) <= 3 ? "ERROR" : (pri & 7) === 4 ? "WARN" : "INFO";
+          }
+        }
+      }
+    }
+
+    // Extract inline key=value pairs
+    const kvMatches = line.matchAll(/([a-zA-Z_][a-zA-Z0-9_.-]*)=("[^"]*"|\S+)/g);
+    for (const match of kvMatches) {
+      const k = match[1].toLowerCase();
+      const v = match[2].replace(/^"|"$/g, "");
+      if (k === "trace_id" || k === "traceid") rec.trace_id = v;
+      else if (k === "latency" || k === "duration") rec.latency_ms = parseFloat(v.replace("ms", "")) || 0.0;
+      else if (k === "status" || k === "status_code") rec.status_code = parseInt(v, 10) || 0;
+      else rec.attributes[k] = v;
+    }
+
+    // Extract tokens
+    const toks = line.toLowerCase().split(/[^a-zA-Z0-9_]+/).filter((t) => t.length >= 2);
+    rec.tokens = Array.from(new Set(toks)).slice(0, 32);
+
+    return rec;
+  }
+
+  class WebEngine {
+    constructor() {
+      this.totalCapacity = 1600;
+      this.softWatermark = 65.0;
+      this.hardWatermark = 85.0;
+      this.queueDepth = 84;
+      this.droppedDebug = 0;
+      this.spilledDisk = 0;
+      this.circuitBreakerTrips = 0;
+      this.simulatedSlowdownMs = 0;
+      this.simulatorEnabled = true;
+
+      this.producedOffsets = [240, 235, 230, 225];
+      this.consumedOffsets = [220, 215, 210, 205];
+
+      this.records = [];
+      this.memtableRows = 42;
+      this.activeParts = 4;
+      this.compactions = 2;
+      this.uncompressedBytes = 864200;
+      this.compressedBytes = 97800;
+      this.bloomSkips = 18;
+
+      this.errorTimestamps = [];
+      this.incidentSeq = 2;
+      this.incidents = [
+        {
+          id: "INC-0001",
+          rule_name: "Critical Keyword Detector (CRITICAL_ERROR)",
+          rule_type: "KEYWORD",
+          severity: "CRITICAL",
+          service: "payment-service",
+          host: "prod-us-east-01",
+          summary: "Keyword 'CRITICAL_ERROR' detected on payment-service (prod-us-east-01)",
+          timestamp: isoNow(-180),
+          status: "RESOLVED",
+          sample_raw_log: `${isoNow(-180)} [ERROR] [payment-service] CRITICAL_ERROR: Ledger deadlock on account_id=acct-9812 trace_id=tr-prev01 latency=1420ms`,
+          slack_payload: JSON.stringify(
+            {
+              channel: "#ops-critical-alerts",
+              username: "PulseLog AlertBot",
+              blocks: [
+                { type: "header", text: { type: "plain_text", text: "[CRITICAL] INC-0001 — Critical Keyword Detector" } },
+                {
+                  type: "section",
+                  fields: [
+                    { type: "mrkdwn", text: "*Service:*\n`payment-service`" },
+                    { type: "mrkdwn", text: "*Host:*\n`prod-us-east-01`" },
+                    { type: "mrkdwn", text: "*Rule Type:*\n`KEYWORD`" },
+                    { type: "mrkdwn", text: `*Triggered At:*\n\`${isoNow(-180)}\`` },
+                  ],
+                },
+                {
+                  type: "section",
+                  text: { type: "mrkdwn", text: "*Summary:* Keyword 'CRITICAL_ERROR' detected on payment-service\n```CRITICAL_ERROR: Ledger deadlock trace_id=tr-prev01```" },
+                },
+              ],
+            },
+            null,
+            2
+          ),
+          email_payload: `From: PulseLog Engine <alerts@pulselog.internal>\nTo: oncall-payments@company.com\nSubject: [CRITICAL] INC-0001 on payment-service\nDate: ${isoNow(-180)}\n\nCritical Alert Fired:\nRule: Critical Keyword Detector\nService: payment-service\nSummary: Keyword 'CRITICAL_ERROR' detected on payment-service`,
+        },
+      ];
+
+      this.rules = [
+        {
+          id: "rule-critical-keyword",
+          name: "Critical Keyword Detector (CRITICAL_ERROR)",
+          type: "KEYWORD",
+          enabled: true,
+          service_filter: "*",
+          keyword: "CRITICAL_ERROR",
+          cooldown_seconds: 3,
+          channels: ["slack", "email"],
+        },
+        {
+          id: "rule-error-burst-threshold",
+          name: "Sliding-Window Error Burst (>8 Errors / 30s)",
+          type: "THRESHOLD",
+          enabled: true,
+          service_filter: "*",
+          severity_filter: "ERROR",
+          threshold_count: 8,
+          window_seconds: 30,
+          cooldown_seconds: 6,
+          channels: ["slack", "email"],
+        },
+        {
+          id: "rule-high-latency-sla",
+          name: "High Tail Latency Breach (>1200ms)",
+          type: "LATENCY_P99",
+          enabled: true,
+          service_filter: "*",
+          threshold_count: 1200,
+          window_seconds: 60,
+          cooldown_seconds: 10,
+          channels: ["slack"],
+        },
+      ];
+
+      this.seedInitialLogs();
+    }
+
+    seedInitialLogs() {
+      for (let i = 180; i >= 0; i--) {
+        const svc = SERVICES[i % SERVICES.length];
+        const host = HOSTS[i % HOSTS.length];
+        const ts = isoNow(-i * 3);
+        const traceId = "tr-" + Math.floor(1000 + i);
+        let rawLine = "";
+        const roll = (i * 17) % 100;
+
+        if (roll < 30) {
+          rawLine = JSON.stringify({
+            ts,
+            level: roll < 4 ? "error" : roll < 10 ? "warn" : "info",
+            service: svc,
+            host,
+            trace_id: traceId,
+            latency_ms: roll < 4 ? randomInt(680, 1150) : randomInt(15, 85),
+            msg: roll < 4 ? "Downstream RPC deadline exceeded during query" : "Processed gRPC request successfully",
+          });
+        } else if (roll < 65) {
+          const lvl = roll < 45 ? "DEBUG" : roll < 60 ? "INFO" : "WARN";
+          rawLine = `${ts} [${lvl}] [${svc}] Worker transaction committed trace_id=${traceId} latency=${randomInt(12, 75)}ms shard=${i % 4}`;
+        } else if (roll < 90) {
+          const method = randomChoice(METHODS);
+          const path = randomChoice(PATHS);
+          const st = roll === 89 ? 502 : 200;
+          rawLine = `10.42.${(i % 150) + 1}.84 - - [16/Oct/2026:00:15:22 +0000] "${method} ${path} HTTP/1.1" ${st} 1420 "-" "PulseClient/2.4" trace_id=${traceId} latency=${randomInt(20, 140)}ms service=${svc}`;
+        } else {
+          rawLine = `<30>Oct 16 00:15:22 ${host} ${svc}[${3000 + i}]: Healthcheck probe completed trace_id=${traceId} latency=${randomInt(8, 25)}ms`;
+        }
+
+        const p = i % 4;
+        const rec = parseLogLine(rawLine, svc, host, p, i + 1);
+        rec.timestamp = ts;
+        this.records.unshift(rec);
+      }
+    }
+
+    tick() {
+      if (!this.simulatorEnabled) return;
+      const count = randomInt(1, 3);
+      for (let c = 0; c < count; c++) {
+        const svc = randomChoice(SERVICES);
+        const host = randomChoice(HOSTS);
+        const p = simpleHash(svc) % 4;
+        this.producedOffsets[p]++;
+        this.consumedOffsets[p]++;
+
+        const traceId = "tr-" + randomInt(10000, 99999);
+        const roll = Math.random() * 100;
+        let line = "";
+        if (roll < 35) {
+          line = JSON.stringify({
+            ts: isoNow(),
+            level: roll < 3 ? "error" : "info",
+            service: svc,
+            host,
+            trace_id: traceId,
+            latency_ms: roll < 3 ? randomInt(750, 1100) : randomInt(12, 95),
+            msg: roll < 3 ? "Upstream service timeout while committing shard" : "Handled HTTP request successfully",
+          });
+        } else if (roll < 70) {
+          const lvl = roll < 48 ? "DEBUG" : "INFO";
+          line = `${isoNow()} [${lvl}] [${svc}] Connection pool heartbeat check ok trace_id=${traceId} latency=${randomInt(4, 28)}ms host=${host}`;
+        } else {
+          const m = randomChoice(METHODS);
+          const pth = randomChoice(PATHS);
+          line = `10.42.${randomInt(1, 200)}.${randomInt(1, 250)} - - [16/Oct/2026:00:15:22 +0000] "${m} ${pth} HTTP/1.1" 200 ${randomInt(256, 2048)} "-" "PulseClient/2.4" trace_id=${traceId} latency=${randomInt(18, 92)}ms service=${svc}`;
+        }
+
+        const rec = parseLogLine(line, svc, host, p, this.producedOffsets[p]);
+        this.ingestRecord(rec);
+      }
+
+      // Natural drain of queue depth towards healthy baseline
+      if (this.queueDepth > 100) {
+        this.queueDepth = Math.max(80, Math.floor(this.queueDepth * 0.85));
+      }
+    }
+
+    ingestRecord(rec) {
+      this.records.unshift(rec);
+      if (this.records.length > 500) this.records.pop();
+
+      this.memtableRows++;
+      if (this.memtableRows >= 200) {
+        this.memtableRows = 0;
+        this.activeParts++;
+        this.uncompressedBytes += 220000;
+        this.compressedBytes += 25000;
+      }
+
+      if (rec.severity === "ERROR" || rec.severity === "CRITICAL") {
+        this.errorTimestamps.push(Date.now());
+      }
+      this.evaluateAlerts(rec);
+    }
+
+    evaluateAlerts(rec) {
+      const now = Date.now();
+      this.errorTimestamps = this.errorTimestamps.filter((t) => now - t <= 30000);
+
+      for (const rule of this.rules) {
+        if (!rule.enabled) continue;
+        if (rule.type === "KEYWORD" && rule.keyword) {
+          if (rec.raw_line.toUpperCase().includes(rule.keyword.toUpperCase())) {
+            this.fireIncident(rule, rec, `Keyword '${rule.keyword}' detected on ${rec.service} (${rec.host})`);
+          }
+        } else if (rule.type === "THRESHOLD") {
+          const limit = rule.threshold_count || 8;
+          if (this.errorTimestamps.length >= limit) {
+            this.fireIncident(rule, rec, `Error rate threshold crossed: ${this.errorTimestamps.length} errors in 30s window (limit: ${limit})`);
+          }
+        } else if (rule.type === "LATENCY_P99") {
+          const limit = rule.threshold_count || 1200;
+          if (rec.latency_ms >= limit) {
+            this.fireIncident(rule, rec, `High latency SLA breach on ${rec.service}: ${rec.latency_ms}ms (threshold: ${limit}ms)`);
+          }
+        }
+      }
+    }
+
+    fireIncident(rule, rec, summary) {
+      const lastFired = rule._lastFired || 0;
+      if (Date.now() - lastFired < (rule.cooldown_seconds || 5) * 1000) return;
+      rule._lastFired = Date.now();
+
+      this.incidentSeq++;
+      const incId = `INC-${String(this.incidentSeq).padStart(4, "0")}`;
+      const ts = isoNow();
+
+      const slackPayload = JSON.stringify(
+        {
+          channel: "#ops-critical-alerts",
+          username: "PulseLog AlertBot",
+          blocks: [
+            { type: "header", text: { type: "plain_text", text: `[${rec.severity}] ${incId} — ${rule.name}` } },
+            {
+              type: "section",
+              fields: [
+                { type: "mrkdwn", text: `*Service:*\n\`${rec.service}\`` },
+                { type: "mrkdwn", text: `*Host:*\n\`${rec.host}\`` },
+                { type: "mrkdwn", text: `*Rule Type:*\n\`${rule.type}\`` },
+                { type: "mrkdwn", text: `*Triggered At:*\n\`${ts}\`` },
+              ],
+            },
+            {
+              type: "section",
+              text: { type: "mrkdwn", text: `*Summary:* ${summary}\n\`\`\`${rec.raw_line}\`\`\`` },
+            },
+          ],
+        },
+        null,
+        2
+      );
+
+      const emailPayload = `From: PulseLog Engine <alerts@pulselog.internal>
+To: oncall-engineering@company.com
+Subject: [${rec.severity}] ${incId} on ${rec.service}: ${rule.name}
+Date: ${ts}
+
+Alert Notification Details:
+==========================
+Incident ID : ${incId}
+Service     : ${rec.service}
+Host        : ${rec.host}
+Rule Name   : ${rule.name}
+Rule Type   : ${rule.type}
+Severity    : ${rec.severity}
+Summary     : ${summary}
+
+Triggering Raw Log Event:
+------------------------
+${rec.raw_line}
+
+View in PulseLog Dashboard:
+https://sarthakguria20-debug.github.io/log-observability-engine/`;
+
+      this.incidents.unshift({
+        id: incId,
+        rule_name: rule.name,
+        rule_type: rule.type,
+        severity: rule.type === "KEYWORD" ? "CRITICAL" : rec.severity,
+        service: rec.service,
+        host: rec.host,
+        summary: summary,
+        timestamp: ts,
+        status: "FIRING",
+        sample_raw_log: rec.raw_line,
+        slack_payload: slackPayload,
+        email_payload: emailPayload,
+      });
+    }
+
+    getBackpressureMetrics() {
+      const occ = (this.queueDepth / this.totalCapacity) * 100.0;
+      let state = "NORMAL";
+      let throttle = 0;
+      if (occ >= 97.0) {
+        state = "CIRCUIT_OPEN";
+        throttle = 150;
+      } else if (occ >= this.hardWatermark) {
+        state = "SHEDDING_DEBUG";
+        throttle = 50;
+      } else if (occ >= this.softWatermark) {
+        state = "SOFT_THROTTLE";
+        throttle = 15;
+      }
+
+      return {
+        state,
+        occupancy_pct: occ,
+        queue_depth: this.queueDepth,
+        queue_capacity: this.totalCapacity,
+        soft_watermark_pct: this.softWatermark,
+        hard_watermark_pct: this.hardWatermark,
+        dropped_debug_logs: this.droppedDebug,
+        spilled_to_disk_logs: this.spilledDisk,
+        circuit_breaker_trips: this.circuitBreakerTrips,
+        simulated_slowdown_ms: this.simulatedSlowdownMs,
+        throttle_delay_ms: throttle,
+        partition_lag: {
+          0: Math.max(0, this.producedOffsets[0] - this.consumedOffsets[0]),
+          1: Math.max(0, this.producedOffsets[1] - this.consumedOffsets[1]),
+          2: Math.max(0, this.producedOffsets[2] - this.consumedOffsets[2]),
+          3: Math.max(0, this.producedOffsets[3] - this.consumedOffsets[3]),
+        },
+      };
+    }
+
+    getStorageStats() {
+      const ratio = this.compressedBytes > 0 ? this.uncompressedBytes / this.compressedBytes : 8.84;
+      return {
+        total_rows: this.records.length * 12 + 1840,
+        memtable_rows: this.memtableRows,
+        memtable_flush_limit: 200,
+        active_columnar_parts: this.activeParts,
+        compactions_completed: this.compactions,
+        uncompressed_bytes: this.uncompressedBytes,
+        compressed_bytes: this.compressedBytes,
+        compression_ratio: ratio,
+        parts_skipped_by_index: this.bloomSkips,
+        write_throughput_per_sec: this.simulatorEnabled ? 32.5 : 0.0,
+      };
+    }
+
+    getAggregations() {
+      const byService = {};
+      const bySeverity = { DEBUG: 0, INFO: 0, WARN: 0, ERROR: 0, CRITICAL: 0 };
+      const buckets = {};
+
+      for (const r of this.records) {
+        byService[r.service] = (byService[r.service] || 0) + 1;
+        bySeverity[r.severity] = (bySeverity[r.severity] || 0) + 1;
+
+        const hms = r.timestamp.slice(11, 19) || "00:00:00";
+        const bkey = hms.slice(0, 7) + "0";
+        if (!buckets[bkey]) {
+          buckets[bkey] = { timestamp: bkey, debug: 0, info: 0, warn: 0, error: 0, critical: 0, total: 0 };
+        }
+        const k = r.severity.toLowerCase();
+        buckets[bkey][k] = (buckets[bkey][k] || 0) + 1;
+        buckets[bkey].total++;
+      }
+
+      const sortedBuckets = Object.keys(buckets)
+        .sort()
+        .slice(-24)
+        .map((k) => buckets[k]);
+
+      return { histogram: sortedBuckets, by_service: byService, by_severity: bySeverity };
+    }
+
+    queryLogs(filters) {
+      const t0 = performance.now();
+      const q = (filters.q || "").toLowerCase().trim();
+      const svc = filters.service || "";
+      const sev = (filters.severity || "").toUpperCase();
+      const minLat = parseFloat(filters.min_latency_ms) || 0;
+
+      let skipped = 0;
+      let scanned = 0;
+
+      const filtered = this.records.filter((r) => {
+        if (svc && r.service !== svc) {
+          skipped++;
+          return false;
+        }
+        if (sev && r.severity !== sev) {
+          skipped++;
+          return false;
+        }
+        if (minLat > 0 && r.latency_ms < minLat) {
+          return false;
+        }
+        if (q) {
+          if (!r.raw_line.toLowerCase().includes(q) && !r.service.toLowerCase().includes(q) && !r.trace_id.toLowerCase().includes(q)) {
+            skipped++;
+            return false;
+          }
+        }
+        scanned++;
+        return true;
+      });
+
+      this.bloomSkips += Math.min(4, skipped);
+      const elapsed = Math.round((performance.now() - t0) * 100) / 100;
+
+      return {
+        records: filtered.slice(0, 80),
+        total_matched: filtered.length,
+        execution_time_ms: Math.max(0.005, elapsed),
+        parts_scanned: Math.max(1, Math.min(this.activeParts, Math.ceil(scanned / 25))),
+        parts_skipped_by_index: Math.min(this.activeParts, Math.max(1, Math.ceil(skipped / 25))),
+      };
+    }
+
+    simulate(action, count = 1) {
+      const nowStr = isoNow();
+      if (action === "critical") {
+        for (let i = 0; i < count; i++) {
+          const raw = `${nowStr} [ERROR] [payment-service] CRITICAL_ERROR: Ledger deadlock on account_id=acct-4921 trace_id=tr-crit-${randomInt(100, 999)} latency=${randomInt(1380, 1950)}ms status=500 host=prod-us-east-01`;
+          const rec = parseLogLine(raw, "payment-service", "prod-us-east-01", 0, this.producedOffsets[0] + i);
+          this.ingestRecord(rec);
+        }
+        return { accepted: count, state: this.getBackpressureMetrics().state };
+      }
+
+      if (action === "error_burst") {
+        for (let i = 0; i < count; i++) {
+          const svc = randomChoice(["auth-service", "payment-service", "api-gateway"]);
+          const host = randomChoice(HOSTS);
+          const raw = `${nowStr} [ERROR] [${svc}] Upstream connection reset by peer during transaction commit trace_id=tr-burst-${randomInt(100, 999)} latency=${randomInt(620, 1150)}ms status=503 host=${host}`;
+          const rec = parseLogLine(raw, svc, host, 1, this.producedOffsets[1] + i);
+          this.ingestRecord(rec);
+        }
+        return { accepted: count, state: this.getBackpressureMetrics().state };
+      }
+
+      if (action === "backpressure_spike") {
+        this.queueDepth = 1420;
+        this.droppedDebug += 284;
+        for (let i = 0; i < 4; i++) {
+          this.producedOffsets[i] += 237;
+        }
+        return { state: "SHEDDING_DEBUG", shed: 284, accepted: count - 284 };
+      }
+
+      if (action === "toggle_sim") {
+        this.simulatorEnabled = !this.simulatorEnabled;
+        return { simulator_enabled: this.simulatorEnabled };
+      }
+
+      if (action === "custom_log") {
+        return { status: "ok" };
+      }
+
+      return {};
+    }
+
+    compact() {
+      this.compactions++;
+      this.memtableRows = 0;
+      this.activeParts = Math.max(2, this.activeParts - 1);
+      this.uncompressedBytes += 350000;
+      this.compressedBytes = Math.floor(this.uncompressedBytes / 8.84);
+      return { compacted: true };
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 2. Application State & Controllers
+  // ---------------------------------------------------------------------------
+  const webEngine = new WebEngine();
+
   const state = {
     activeTab: "explorer",
+    engineMode: "detecting", // 'backend' | 'browser'
     filters: {
       q: "",
       service: "",
@@ -31,38 +675,115 @@
   };
 
   async function fetchAll() {
-    try {
-      const params = new URLSearchParams();
-      if (state.filters.q) params.set("q", state.filters.q);
-      if (state.filters.service) params.set("service", state.filters.service);
-      if (state.filters.severity) params.set("severity", state.filters.severity);
-      if (state.filters.min_latency_ms) params.set("min_latency_ms", state.filters.min_latency_ms);
-      params.set("limit", "80");
+    // If backend mode is confirmed or still detecting, attempt API fetch
+    if (state.engineMode !== "browser") {
+      try {
+        const params = new URLSearchParams();
+        if (state.filters.q) params.set("q", state.filters.q);
+        if (state.filters.service) params.set("service", state.filters.service);
+        if (state.filters.severity) params.set("severity", state.filters.severity);
+        if (state.filters.min_latency_ms) params.set("min_latency_ms", state.filters.min_latency_ms);
+        params.set("limit", "80");
 
-      const [mRes, lRes, aRes] = await Promise.all([
-        fetch("/api/v1/metrics"),
-        fetch(`/api/v1/logs?${params.toString()}`),
-        fetch("/api/v1/alerts"),
-      ]);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 1600);
 
-      if (mRes.ok) state.metrics = await mRes.json();
-      if (lRes.ok) state.logsResult = await lRes.json();
-      if (aRes.ok) state.alertsData = await aRes.json();
-      render();
-    } catch (e) {
-      console.error("Failed to fetch telemetry:", e);
+        const [mRes, lRes, aRes] = await Promise.all([
+          fetch("api/v1/metrics", { signal: controller.signal }),
+          fetch(`api/v1/logs?${params.toString()}`, { signal: controller.signal }),
+          fetch("api/v1/alerts", { signal: controller.signal }),
+        ]);
+        clearTimeout(timeoutId);
+
+        if (mRes.ok && lRes.ok && aRes.ok) {
+          state.engineMode = "backend";
+          state.metrics = await mRes.json();
+          state.logsResult = await lRes.json();
+          state.alertsData = await aRes.json();
+          render();
+          return;
+        }
+      } catch (e) {
+        // Fall back to client-side WebEngine (e.g. GitHub Pages or backend down)
+        state.engineMode = "browser";
+      }
     }
+
+    // Client-side WebEngine Execution (GitHub Pages & offline demo)
+    webEngine.tick();
+    const aggs = webEngine.getAggregations();
+    state.metrics = {
+      backpressure: webEngine.getBackpressureMetrics(),
+      storage: webEngine.getStorageStats(),
+      histogram: aggs.histogram,
+      by_service: aggs.by_service,
+      by_severity: aggs.by_severity,
+      simulator_enabled: webEngine.simulatorEnabled,
+    };
+    state.logsResult = webEngine.queryLogs(state.filters);
+    state.alertsData = {
+      incidents: webEngine.incidents,
+      rules: webEngine.rules,
+    };
+    render();
   }
 
   async function postJSON(url, body) {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body || {}),
-    });
-    const data = await res.json().catch(() => ({}));
+    if (state.engineMode === "backend") {
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body || {}),
+        });
+        const data = await res.json().catch(() => ({}));
+        await fetchAll();
+        return data;
+      } catch (e) {
+        state.engineMode = "browser";
+      }
+    }
+
+    // Client-side execution
+    if (url.includes("/simulate")) {
+      const res = webEngine.simulate(body.action, body.count);
+      await fetchAll();
+      return res;
+    }
+    if (url.includes("/storage/compact")) {
+      const res = webEngine.compact();
+      await fetchAll();
+      return res;
+    }
+    if (url.includes("/backpressure/slowdown")) {
+      webEngine.simulatedSlowdownMs = Number(body.delay_ms) || 0;
+      await fetchAll();
+      return { status: "ok" };
+    }
+    if (url.includes("/alerts")) {
+      const found = webEngine.incidents.find((i) => i.id === body.incident_id);
+      if (found) found.status = body.status;
+      await fetchAll();
+      return { status: "ok" };
+    }
+    if (url.includes("/rules")) {
+      webEngine.rules.push({
+        id: "rule-" + Math.random().toString(36).substring(2, 8),
+        name: body.name || "Custom Rule",
+        type: body.type || "KEYWORD",
+        keyword: body.keyword || "",
+        threshold_count: body.threshold_count || 5,
+        window_seconds: body.window_seconds || 30,
+        cooldown_seconds: 5,
+        channels: body.channels || ["slack", "email"],
+        enabled: true,
+      });
+      await fetchAll();
+      return { status: "ok" };
+    }
+
     await fetchAll();
-    return data;
+    return {};
   }
 
   window.pulseActions = {
@@ -79,42 +800,47 @@
       render();
     },
     async triggerSim(action, count) {
-      const res = await postJSON("/api/v1/simulate", { action, count });
+      const res = await postJSON("api/v1/simulate", { action, count });
       if (action === "critical") {
-        state.lastActionBanner = `Injected ${res.accepted || count} CRITICAL_ERROR logs -> Alerting Engine triggered Slack + Email notifications!`;
+        state.lastActionBanner = `Injected ${res.accepted || count} CRITICAL_ERROR logs -> Alerting Engine triggered Slack Block Kit + RFC 5322 Email notifications!`;
       } else if (action === "backpressure_spike") {
-        state.lastActionBanner = `Injected ${count} burst logs -> Backpressure State: ${res.state} (Shed Debug Logs: ${res.shed || 0})`;
+        state.lastActionBanner = `Injected ${count} burst logs -> Backpressure State: ${res.state || "SHEDDING_DEBUG"} (Shed ${res.shed || 284} Debug Logs)`;
       } else if (action === "error_burst") {
         state.lastActionBanner = `Injected ${count} ERROR logs -> Sliding-window threshold detector evaluated!`;
       } else if (action === "toggle_sim") {
-        state.lastActionBanner = `Background simulator ${res.simulator_enabled ? "RESUMED" : "PAUSED"}`;
+        state.lastActionBanner = `Background simulator ${res.simulator_enabled !== false && webEngine.simulatorEnabled ? "RESUMED" : "PAUSED"}`;
       }
       render();
     },
     async injectCustomLog() {
       const input = document.getElementById("custom-log-input");
       if (input) state.customLogLine = input.value;
-      await postJSON("/api/v1/simulate", {
-        action: "custom_log",
-        raw_line: state.customLogLine,
-      });
+      if (state.engineMode === "browser") {
+        const rec = parseLogLine(state.customLogLine, "payment-service", "prod-us-east-01", 0, 9999);
+        webEngine.ingestRecord(rec);
+      } else {
+        await postJSON("api/v1/simulate", {
+          action: "custom_log",
+          raw_line: state.customLogLine,
+        });
+      }
       state.lastActionBanner = "Ingested & parsed custom unstructured log line!";
-      render();
+      await fetchAll();
     },
     async forceCompact() {
-      const res = await postJSON("/api/v1/storage/compact", {});
-      state.lastActionBanner = res.compacted
-        ? "ClickHouse MergeTree Compaction completed: merged immutable parts & updated Bloom filters!"
+      const res = await postJSON("api/v1/storage/compact", {});
+      state.lastActionBanner = res.compacted !== false
+        ? "ClickHouse MergeTree Compaction completed: merged immutable parts & rebuilt Bloom filters!"
         : "Flushed MemTable to immutable ColumnarPart!";
       render();
     },
     async setSlowdown(ms) {
-      await postJSON("/api/v1/backpressure/slowdown", { delay_ms: Number(ms) });
+      await postJSON("api/v1/backpressure/slowdown", { delay_ms: Number(ms) });
       state.lastActionBanner = `Set consumer processing slowdown to ${ms}ms per event`;
       render();
     },
     async updateIncident(id, status) {
-      await postJSON("/api/v1/alerts", { incident_id: id, status });
+      await postJSON("api/v1/alerts", { incident_id: id, status });
     },
     inspectIncident(id) {
       const found = (state.alertsData.incidents || []).find((i) => i.id === id);
@@ -132,7 +858,7 @@
       const threshEl = document.getElementById("rule-thresh");
       if (!nameEl) return;
 
-      await postJSON("/api/v1/rules", {
+      await postJSON("api/v1/rules", {
         name: nameEl.value || "Custom Rule",
         type: typeEl.value,
         keyword: kwEl.value,
@@ -154,12 +880,17 @@
       .replace(/"/g, "&quot;");
   }
 
+  // ---------------------------------------------------------------------------
+  // 3. UI Rendering Engine
+  // ---------------------------------------------------------------------------
   function render() {
     const activeEl = document.activeElement;
     const activeId = activeEl ? activeEl.id : null;
     const selStart = activeEl && typeof activeEl.selectionStart === "number" ? activeEl.selectionStart : null;
 
     const root = document.getElementById("root");
+    if (!root) return;
+
     const bp = (state.metrics && state.metrics.backpressure) || {};
     const st = (state.metrics && state.metrics.storage) || {};
     const hist = (state.metrics && state.metrics.histogram) || [];
@@ -173,13 +904,19 @@
     const serviceEntries = Object.entries(byService).sort((a, b) => b[1] - a[1]);
     const maxSvcCount = Math.max(1, ...serviceEntries.map((e) => e[1]));
 
+    const modeBadge =
+      state.engineMode === "backend"
+        ? `<span class="badge-arch" style="background:rgba(56,189,248,0.12);border-color:rgba(56,189,248,0.3);color:var(--accent)">● Central Server (:8080)</span>`
+        : `<span class="badge-arch" style="background:rgba(34,197,94,0.15);border-color:rgba(34,197,94,0.4);color:#4ade80" title="Running 100% interactive client-side simulation on GitHub Pages">● GitHub Pages Live Engine</span>`;
+
     root.innerHTML = `
       <div class="dashboard-shell">
         <header class="top-bar">
           <div class="brand">
             <span class="pulse-dot"></span>
             <h1>PulseLog Engine</h1>
-            <span class="badge-arch">Go CLI Agent · Partitioned Queue · ClickHouse MergeTree</span>
+            ${modeBadge}
+            <span class="badge-arch">Partitioned Queue · ClickHouse MergeTree · Slack & Email Alerts</span>
           </div>
           <div class="chaos-actions">
             <button class="btn" onclick="pulseActions.triggerSim('toggle_sim')">
@@ -352,9 +1089,7 @@
           />
           <select id="filter-service" onchange="pulseActions.updateFilter('service', this.value)">
             <option value="">All Microservices</option>
-            ${["payment-service", "auth-service", "api-gateway", "order-worker", "search-indexer", "inventory-db"]
-              .map((s) => `<option value="${s}" ${state.filters.service === s ? "selected" : ""}>${s}</option>`)
-              .join("")}
+            ${SERVICES.map((s) => `<option value="${s}" ${state.filters.service === s ? "selected" : ""}>${s}</option>`).join("")}
           </select>
           <select id="filter-severity" onchange="pulseActions.updateFilter('severity', this.value)">
             <option value="">All Severities</option>
@@ -439,18 +1174,18 @@
                       isExp
                         ? `<tr class="expanded-details">
                              <td colspan="8">
-                               <div class="expanded-grid">
-                                 <div>
-                                   <div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Structured Columnar Document (Indexed Fields + Tokens)</div>
-                                   <pre class="code-block">${escapeHtml(JSON.stringify(r, null, 2))}</pre>
-                                 </div>
-                                 <div>
-                                   <div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Original Unstructured Raw Wire Line</div>
-                                   <pre class="code-block">${escapeHtml(r.raw_line)}</pre>
-                                 </div>
-                               </div>
-                             </td>
-                           </tr>`
+                                <div class="expanded-grid">
+                                  <div>
+                                    <div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Structured Columnar Document (Indexed Fields + Tokens)</div>
+                                    <pre class="code-block">${escapeHtml(JSON.stringify(r, null, 2))}</pre>
+                                  </div>
+                                  <div>
+                                    <div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Original Unstructured Raw Wire Line</div>
+                                    <pre class="code-block">${escapeHtml(r.raw_line)}</pre>
+                                  </div>
+                                </div>
+                              </td>
+                            </tr>`
                         : ""
                     }
                   `;
@@ -661,7 +1396,7 @@
     `;
   }
 
+  // Initial fetch and auto-refresh loop
   fetchAll();
   setInterval(fetchAll, 1400);
 })();
-

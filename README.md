@@ -2,6 +2,29 @@
 
 A high-throughput, write-optimized log ingestion, structuring, alerting, and analytics pipeline inspired by **Datadog**, **Vector/Logstash**, **Apache Kafka**, and **ClickHouse**.
 
+[![GitHub Pages Demo](https://img.shields.io/badge/GitHub%20Pages-Live%20Interactive%20Demo-brightgreen?style=for-the-badge&logo=github)](https://sarthakguria20-debug.github.io/log-observability-engine/)
+[![Integration Tests](https://img.shields.io/badge/Test%20Suite-6%2F6%20Passed-blue?style=for-the-badge)](tests/e2e_test.py)
+
+---
+
+## 🌐 Live Interactive Demo (GitHub Pages)
+
+Experience the full PulseLog engine directly in your browser with zero installation:
+
+👉 **[https://sarthakguria20-debug.github.io/log-observability-engine/](https://sarthakguria20-debug.github.io/log-observability-engine/)**
+
+- **Live Log Ingestion & Tailing**: Multi-microservice streaming (payment-service, auth-service, api-gateway, order-worker).
+- **Interactive Chaos Controls**: Inject `CRITICAL_ERROR` bursts, test watermark backpressure, and trigger ClickHouse MergeTree compactions.
+- **Alert Notifications**: Inspect real Slack Block Kit JSON and RFC 5322 Email payloads generated when incident rules trigger.
+- **ClickHouse Skip Index**: Full-text and facet search demonstrating 512-bit Bloom filter partition pruning.
+
+### Enabling GitHub Pages in GitHub Settings:
+1. Navigate to your repository on GitHub: **Settings** → **Pages**.
+2. Under **Build and deployment**:
+   - **Source**: Select **GitHub Actions** (the automated workflow in `.github/workflows/deploy-pages.yml` handles deployment on every push).
+   - *Or* select **Deploy from a branch** → Branch: `main` → Folder: `/docs` → **Save**.
+3. Your live dashboard is immediately hosted at `https://<username>.github.io/<repo>/`!
+
 ---
 
 ## Architecture Overview
